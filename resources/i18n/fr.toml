@@ -33,6 +33,11 @@ description = "No access."
 one = "Aucun d'access."
 other = "Aucun d'access."
 
+[NeedLogin]
+description = "Need login."
+one = "Veuillez vous connecter d'abord."
+other = "Veuillez vous connecter d'abord."
+
 [UsernameOrPasswordError]
 description = "Username or password error."
 one = "Nom d'utilisateur ou de mot de passe incorrect."
