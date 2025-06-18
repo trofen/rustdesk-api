@@ -31,5 +31,7 @@ build_and_run() {
     echo "docker compose -f ${COMPOSE_FILE_NAME} logs -f"
 }
 
+
 # Execute build and start function
 build_and_run
+
