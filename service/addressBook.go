@@ -126,31 +126,57 @@ func (s *AddressBookService) FromPeer(peer *model.Peer) (a *model.AddressBook) {
 	return a
 }
 
-// Create 创建
+// Create adds an address book record.
 func (s *AddressBookService) Create(u *model.AddressBook) error {
 	res := DB.Create(u).Error
 	return res
 }
 func (s *AddressBookService) Delete(u *model.AddressBook) error {
-	return DB.Delete(u).Error
+	tx := DB.Begin()
+	if err := tx.Where("address_book_row_id = ?", u.RowId).Delete(&model.AddressBookRule{}).Error; err != nil {
+		tx.Rollback()
+		return err
+	}
+	if err := tx.Delete(u).Error; err != nil {
+		tx.Rollback()
+		return err
+	}
+	return tx.Commit().Error
 }
 
-// Update 更新
+// Update changes an address book record.
 func (s *AddressBookService) Update(u *model.AddressBook) error {
 	return DB.Model(u).Updates(u).Error
 }
 
-// UpdateByMap 更新
+// UpdateByMap changes selected address book fields.
 func (s *AddressBookService) UpdateByMap(u *model.AddressBook, data map[string]interface{}) error {
 	return DB.Model(u).Updates(data).Error
 }
 
-// UpdateAll 更新
+// UpdateAll replaces all editable address book fields and keeps record rules in the same collection.
 func (s *AddressBookService) UpdateAll(u *model.AddressBook) error {
-	return DB.Model(u).Select("*").Omit("created_at").Updates(u).Error
+	existing := s.InfoByRowId(u.RowId)
+	tx := DB.Begin()
+	if err := tx.Model(u).Select("*").Omit("created_at").Updates(u).Error; err != nil {
+		tx.Rollback()
+		return err
+	}
+	if existing.RowId != 0 && (existing.CollectionId != u.CollectionId || existing.UserId != u.UserId) {
+		if err := tx.Model(&model.AddressBookRule{}).
+			Where("address_book_row_id = ?", u.RowId).
+			Updates(map[string]interface{}{
+				"collection_id": u.CollectionId,
+				"user_id":       u.UserId,
+			}).Error; err != nil {
+			tx.Rollback()
+			return err
+		}
+	}
+	return tx.Commit().Error
 }
 
-// ShareByWebClient 分享
+// ShareByWebClient creates a web-client share token.
 func (s *AddressBookService) ShareByWebClient(m *model.ShareRecord) error {
 	m.ShareToken = uuid.New().String()
 	return DB.Create(m).Error
@@ -216,48 +242,118 @@ func (s *AddressBookService) CollectionInfoById(id uint) *model.AddressBookColle
 }
 
 func (s *AddressBookService) CollectionReadRules(user *model.User) (res []*model.AddressBookCollectionRule) {
-	// personalRules
+	// Personal rules that grant read access.
 	var personalRules []*model.AddressBookCollectionRule
 	tx2 := DB.Model(&model.AddressBookCollectionRule{})
 	tx2.Where("type = ? and to_id = ? and rule > 0", model.ShareAddressBookRuleTypePersonal, user.Id).Find(&personalRules)
 	res = append(res, personalRules...)
 
-	//group
-	var groupRules []*model.AddressBookCollectionRule
-	tx3 := DB.Model(&model.AddressBookCollectionRule{})
-	tx3.Where("type = ? and to_id = ? and rule > 0", model.ShareAddressBookRuleTypeGroup, user.GroupId).Find(&groupRules)
-	res = append(res, groupRules...)
+	if user.GroupId > 0 {
+		// Group rules that grant read access.
+		var groupRules []*model.AddressBookCollectionRule
+		tx3 := DB.Model(&model.AddressBookCollectionRule{})
+		tx3.Where("type = ? and to_id = ? and rule > 0", model.ShareAddressBookRuleTypeGroup, user.GroupId).Find(&groupRules)
+		res = append(res, groupRules...)
+	}
 	return
 }
 
-func (s *AddressBookService) UserMaxRule(user *model.User, uid, cid uint) int {
-	// ismy?
-	if user.Id == uid {
+func ResolveRuleByPriority(inherited int, personalRule, groupRule *int) int {
+	if personalRule != nil {
+		return *personalRule
+	}
+	if groupRule != nil {
+		return *groupRule
+	}
+	return inherited
+}
+
+func ResolveOwnedRule(viewerID, ownerID uint, inherited int, personalRule, groupRule *int) int {
+	if viewerID == ownerID {
 		return model.ShareAddressBookRuleRuleFullControl
 	}
-	max := 0
+	return ResolveRuleByPriority(inherited, personalRule, groupRule)
+}
+
+func ResolveAddressBookRule(inherited int, rowID uint, personalRules, groupRules map[uint]int) int {
+	if rule, ok := personalRules[rowID]; ok {
+		return rule
+	}
+	if rule, ok := groupRules[rowID]; ok {
+		return rule
+	}
+	return inherited
+}
+
+func splitAddressBookRuleMaps(rules []*model.AddressBookRule) (personalRules, groupRules map[uint]int) {
+	personalRules = make(map[uint]int)
+	groupRules = make(map[uint]int)
+	for _, rule := range rules {
+		if rule.Type == model.ShareAddressBookRuleTypePersonal {
+			personalRules[rule.AddressBookRowId] = rule.Rule
+		}
+		if rule.Type == model.ShareAddressBookRuleTypeGroup {
+			groupRules[rule.AddressBookRowId] = rule.Rule
+		}
+	}
+	return personalRules, groupRules
+}
+
+func (s *AddressBookService) UserMaxRule(user *model.User, uid, cid uint) int {
+	if user == nil || user.Id == 0 {
+		return model.ShareAddressBookRuleRuleNone
+	}
+
 	personalRules := &model.AddressBookCollectionRule{}
 	tx := DB.Model(personalRules)
 	tx.Where("type = ? and collection_id = ? and to_id = ?", model.ShareAddressBookRuleTypePersonal, cid, user.Id).First(&personalRules)
+	var personalRule *int
 	if personalRules.Id != 0 {
-		max = personalRules.Rule
-		if max == model.ShareAddressBookRuleRuleFullControl {
-			return max
-		}
+		personalRule = &personalRules.Rule
 	}
 
 	groupRules := &model.AddressBookCollectionRule{}
-	tx2 := DB.Model(groupRules)
-	tx2.Where("type = ? and collection_id = ? and to_id = ?", model.ShareAddressBookRuleTypeGroup, cid, user.GroupId).First(&groupRules)
-	if groupRules.Id != 0 {
-		if groupRules.Rule > max {
-			max = groupRules.Rule
-		}
-		if max == model.ShareAddressBookRuleRuleFullControl {
-			return max
+	var groupRule *int
+	if user.GroupId > 0 {
+		tx2 := DB.Model(groupRules)
+		tx2.Where("type = ? and collection_id = ? and to_id = ?", model.ShareAddressBookRuleTypeGroup, cid, user.GroupId).First(&groupRules)
+		if groupRules.Id != 0 {
+			groupRule = &groupRules.Rule
 		}
 	}
-	return max
+	return ResolveOwnedRule(user.Id, uid, model.ShareAddressBookRuleRuleNone, personalRule, groupRule)
+}
+
+func (s *AddressBookService) UserAddressBookRule(user *model.User, uid, cid, rowID uint) int {
+	if user == nil || user.Id == 0 {
+		return model.ShareAddressBookRuleRuleNone
+	}
+	inherited := s.UserMaxRule(user, uid, cid)
+	if user.Id == uid {
+		return inherited
+	}
+
+	personalRule := &model.AddressBookRule{}
+	DB.Where("type = ? and address_book_row_id = ? and to_id = ?", model.ShareAddressBookRuleTypePersonal, rowID, user.Id).First(personalRule)
+	var personalRuleValue *int
+	if personalRule.Id != 0 {
+		personalRuleValue = &personalRule.Rule
+	}
+
+	groupRule := &model.AddressBookRule{}
+	var groupRuleValue *int
+	if user.GroupId > 0 {
+		DB.Where("type = ? and address_book_row_id = ? and to_id = ?", model.ShareAddressBookRuleTypeGroup, rowID, user.GroupId).First(groupRule)
+		if groupRule.Id != 0 {
+			groupRuleValue = &groupRule.Rule
+		}
+	}
+	return ResolveOwnedRule(user.Id, uid, inherited, personalRuleValue, groupRuleValue)
+}
+
+func (s *AddressBookService) AddressBookRuleMapsForUserAndCollection(user *model.User, cid uint) (map[uint]int, map[uint]int) {
+	rules := s.AddressBookRulesForUserAndCollection(user, cid)
+	return splitAddressBookRuleMaps(rules)
 }
 
 func (s *AddressBookService) CheckUserReadPrivilege(user *model.User, uid, cid uint) bool {
@@ -279,9 +375,10 @@ func (s *AddressBookService) UpdateCollection(t *model.AddressBookCollection) er
 }
 
 func (s *AddressBookService) DeleteCollection(t *model.AddressBookCollection) error {
-	//删除集合下的所有规则、地址簿，再删除集合
+	// Delete all rules and address book records before deleting the collection.
 	tx := DB.Begin()
 	tx.Where("collection_id = ?", t.Id).Delete(&model.AddressBookCollectionRule{})
+	tx.Where("collection_id = ?", t.Id).Delete(&model.AddressBookRule{})
 	tx.Where("collection_id = ?", t.Id).Delete(&model.AddressBook{})
 	tx.Delete(t)
 	return tx.Commit().Error
@@ -319,14 +416,100 @@ func (s *AddressBookService) ListRules(page uint, size uint, f func(tx *gorm.DB)
 }
 
 func (s *AddressBookService) UpdateRule(t *model.AddressBookCollectionRule) error {
-	return DB.Model(t).Updates(t).Error
+	return DB.Model(t).Select("*").Omit("created_at").Updates(t).Error
 }
 
 func (s *AddressBookService) DeleteRule(t *model.AddressBookCollectionRule) error {
 	return DB.Delete(t).Error
 }
 
-// CheckCollectionOwner 检查Collection的所有者
+func (s *AddressBookService) CollectionRulesForUser(user *model.User) (res []*model.AddressBookCollectionRule) {
+	if user == nil || user.Id == 0 {
+		return
+	}
+	var personalRules []*model.AddressBookCollectionRule
+	DB.Where("type = ? and to_id = ?", model.ShareAddressBookRuleTypePersonal, user.Id).Find(&personalRules)
+	res = append(res, personalRules...)
+
+	if user.GroupId > 0 {
+		var groupRules []*model.AddressBookCollectionRule
+		DB.Where("type = ? and to_id = ?", model.ShareAddressBookRuleTypeGroup, user.GroupId).Find(&groupRules)
+		res = append(res, groupRules...)
+	}
+	return
+}
+
+func (s *AddressBookService) AddressBookRulesForUser(user *model.User) (res []*model.AddressBookRule) {
+	if user == nil || user.Id == 0 {
+		return
+	}
+	var personalRules []*model.AddressBookRule
+	DB.Where("type = ? and to_id = ?", model.ShareAddressBookRuleTypePersonal, user.Id).Find(&personalRules)
+	res = append(res, personalRules...)
+
+	if user.GroupId > 0 {
+		var groupRules []*model.AddressBookRule
+		DB.Where("type = ? and to_id = ?", model.ShareAddressBookRuleTypeGroup, user.GroupId).Find(&groupRules)
+		res = append(res, groupRules...)
+	}
+	return
+}
+
+func (s *AddressBookService) AddressBookRulesForUserAndCollection(user *model.User, cid uint) (res []*model.AddressBookRule) {
+	if user == nil || user.Id == 0 {
+		return
+	}
+	var personalRules []*model.AddressBookRule
+	DB.Where("type = ? and to_id = ? and collection_id = ?", model.ShareAddressBookRuleTypePersonal, user.Id, cid).Find(&personalRules)
+	res = append(res, personalRules...)
+
+	if user.GroupId > 0 {
+		var groupRules []*model.AddressBookRule
+		DB.Where("type = ? and to_id = ? and collection_id = ?", model.ShareAddressBookRuleTypeGroup, user.GroupId, cid).Find(&groupRules)
+		res = append(res, groupRules...)
+	}
+	return
+}
+
+func (s *AddressBookService) AddressBookRuleInfoById(u uint) *model.AddressBookRule {
+	p := &model.AddressBookRule{}
+	DB.Where("id = ?", u).First(p)
+	return p
+}
+
+func (s *AddressBookService) AddressBookRuleInfoByToIdAndRowId(t int, toid, rowID uint) *model.AddressBookRule {
+	p := &model.AddressBookRule{}
+	DB.Where("type = ? and to_id = ? and address_book_row_id = ?", t, toid, rowID).First(p)
+	return p
+}
+
+func (s *AddressBookService) CreateAddressBookRule(t *model.AddressBookRule) error {
+	return DB.Create(t).Error
+}
+
+func (s *AddressBookService) ListAddressBookRules(page uint, size uint, f func(tx *gorm.DB)) *model.AddressBookRuleList {
+	res := &model.AddressBookRuleList{}
+	res.Page = int64(page)
+	res.PageSize = int64(size)
+	tx := DB.Model(&model.AddressBookRule{})
+	if f != nil {
+		f(tx)
+	}
+	tx.Count(&res.Total)
+	tx.Scopes(Paginate(page, size))
+	tx.Find(&res.AddressBookRule)
+	return res
+}
+
+func (s *AddressBookService) UpdateAddressBookRule(t *model.AddressBookRule) error {
+	return DB.Model(t).Select("*").Omit("created_at").Updates(t).Error
+}
+
+func (s *AddressBookService) DeleteAddressBookRule(t *model.AddressBookRule) error {
+	return DB.Delete(t).Error
+}
+
+// CheckCollectionOwner checks whether uid owns the collection.
 func (s *AddressBookService) CheckCollectionOwner(uid uint, cid uint) bool {
 	p := s.CollectionInfoById(cid)
 	return p.UserId == uid

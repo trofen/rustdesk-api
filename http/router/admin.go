@@ -37,6 +37,7 @@ func Init(g *gin.Engine) {
 	AuditBind(adg)
 	AddressBookCollectionBind(adg)
 	AddressBookCollectionRuleBind(adg)
+	AddressBookRuleBind(adg)
 	UserTokenBind(adg)
 
 	//deprecated by ConfigBind
@@ -225,6 +226,17 @@ func AddressBookCollectionRuleBind(rg *gin.RouterGroup) {
 		aR.POST("/delete", cont.Delete)
 	}
 }
+func AddressBookRuleBind(rg *gin.RouterGroup) {
+	aR := rg.Group("/address_book_rule").Use(middleware.AdminPrivilege())
+	{
+		cont := &admin.AddressBookRule{}
+		aR.GET("/list", cont.List)
+		aR.GET("/detail/:id", cont.Detail)
+		aR.POST("/create", cont.Create)
+		aR.POST("/update", cont.Update)
+		aR.POST("/delete", cont.Delete)
+	}
+}
 func UserTokenBind(rg *gin.RouterGroup) {
 	aR := rg.Group("/user_token").Use(middleware.AdminPrivilege())
 	cont := &admin.UserToken{}
@@ -297,6 +309,13 @@ func MyBind(rg *gin.RouterGroup) {
 		rg.POST("/my/address_book_collection_rule/create", cont.Create)
 		rg.POST("/my/address_book_collection_rule/update", cont.Update)
 		rg.POST("/my/address_book_collection_rule/delete", cont.Delete)
+	}
+	{
+		cont := &my.AddressBookRule{}
+		rg.GET("/my/address_book_rule/list", cont.List)
+		rg.POST("/my/address_book_rule/create", cont.Create)
+		rg.POST("/my/address_book_rule/update", cont.Update)
+		rg.POST("/my/address_book_rule/delete", cont.Delete)
 	}
 	{
 		cont := &my.Peer{}

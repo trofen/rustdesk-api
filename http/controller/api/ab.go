@@ -375,13 +375,13 @@ func (a *Ab) Settings(c *gin.Context) {
 }
 
 // SharedProfiles
-// @Tags 地址[Personal]
-// @Summary 共享地址簿
-// @Description 共享
+// @Tags Address[Personal]
+// @Summary Shared address books
+// @Description Shared address books
 // @Accept  json
 // @Produce  json
-// @Param current query int false "页码"
-// @Param pageSize query int false "每页数量"
+// @Param current query int false "page"
+// @Param pageSize query int false "page size"
 // @Success 200 {object} response.Response
 // @Failure 500 {object} response.Response
 // @Router /ab/shared/profiles [post]
@@ -401,26 +401,24 @@ func (a *Ab) SharedProfiles(c *gin.Context) {
 		})
 	}
 
-	allAbIds := make(map[uint]int) //用map去重，并保留最大Rule
-	allUserIds := make(map[uint]*model.User)
-	rules := service.AllService.AddressBookService.CollectionReadRules(user)
-	for _, rule := range rules {
-		//先判断是否存在
-		r, ok := allAbIds[rule.CollectionId]
-		if ok {
-			//再判断权限大小
-			if r < rule.Rule {
-				allAbIds[rule.CollectionId] = rule.Rule
-			}
-		} else {
-			allAbIds[rule.CollectionId] = rule.Rule
-			allUserIds[rule.UserId] = nil
+	candidateCollectionIds := make(map[uint]bool)
+	for _, rule := range service.AllService.AddressBookService.CollectionRulesForUser(user) {
+		if rule.CollectionId > 0 {
+			candidateCollectionIds[rule.CollectionId] = true
 		}
-
 	}
-	abids := utils.Keys(allAbIds)
+	for _, rule := range service.AllService.AddressBookService.AddressBookRulesForUser(user) {
+		if rule.CollectionId > 0 {
+			candidateCollectionIds[rule.CollectionId] = true
+		}
+	}
+	abids := utils.Keys(candidateCollectionIds)
 	collections := service.AllService.AddressBookService.ListCollectionByIds(abids)
 
+	allUserIds := make(map[uint]*model.User)
+	for _, collection := range collections {
+		allUserIds[collection.UserId] = nil
+	}
 	ids := utils.Keys(allUserIds)
 	allUsers := service.AllService.UserService.ListByIds(ids)
 	for _, u := range allUsers {
@@ -428,15 +426,23 @@ func (a *Ab) SharedProfiles(c *gin.Context) {
 	}
 
 	for _, collection := range collections {
+		if collection.UserId == user.Id {
+			continue
+		}
 		_u, ok := allUserIds[collection.UserId]
-		if !ok {
+		if !ok || _u == nil {
+			continue
+		}
+		al := service.AllService.AddressBookService.ListByUserIdAndCollectionId(collection.UserId, collection.Id, 1, 1000)
+		_, rule := a.AddressBooksVisibleToUser(user, collection.UserId, collection.Id, al.AddressBooks)
+		if rule < model.ShareAddressBookRuleRuleRead {
 			continue
 		}
 		res = append(res, &api.SharedProfilesPayload{
 			Guid:  a.ComposeGuid(_u.GroupId, _u.Id, collection.Id),
 			Name:  collection.Name,
 			Owner: _u.Username,
-			Rule:  allAbIds[collection.Id],
+			Rule:  rule,
 		})
 	}
 
@@ -448,7 +454,7 @@ func (a *Ab) SharedProfiles(c *gin.Context) {
 
 // ParseGuid
 func (a *Ab) ParseGuid(guid string) (gid, uid, cid uint) {
-	//用-切割 guid
+	// Split guid by "-".
 	guids := strings.Split(guid, "-")
 	if len(guids) < 2 {
 		return 0, 0, 0
@@ -520,14 +526,40 @@ func (a *Ab) CheckGuid(cu *model.User, guid string) (gid, uid, cid uint, err err
 	return
 }
 
+func (a *Ab) AddressBooksVisibleToUser(currentUser *model.User, ownerID, collectionID uint, addressBooks []*model.AddressBook) ([]*model.AddressBook, int) {
+	collectionRule := service.AllService.AddressBookService.UserMaxRule(currentUser, ownerID, collectionID)
+	maxRule := collectionRule
+	personalRules, groupRules := service.AllService.AddressBookService.AddressBookRuleMapsForUserAndCollection(currentUser, collectionID)
+
+	res := make([]*model.AddressBook, 0, len(addressBooks))
+	for _, ab := range addressBooks {
+		rule := collectionRule
+		if currentUser.Id != ownerID {
+			rule = service.ResolveAddressBookRule(collectionRule, ab.RowId, personalRules, groupRules)
+		}
+		if rule > maxRule {
+			maxRule = rule
+		}
+		if rule < model.ShareAddressBookRuleRuleRead {
+			continue
+		}
+		item := *ab
+		if rule < model.ShareAddressBookRuleRuleReadWrite {
+			item.Password = ""
+		}
+		res = append(res, &item)
+	}
+	return res, maxRule
+}
+
 // Peers
-// @Tags 地址[Personal]
-// @Summary 地址列表
-// @Description 地址
+// @Tags Address[Personal]
+// @Summary Address book records
+// @Description Address book records visible to the current user
 // @Accept  json
 // @Produce  json
-// @Param current query int false "页码"
-// @Param pageSize query int false "每页数量"
+// @Param current query int false "page"
+// @Param pageSize query int false "page size"
 // @Param ab query string false "guid"
 // @Success 200 {object} response.Response
 // @Failure 500 {object} response.Response
@@ -542,16 +574,15 @@ func (a *Ab) Peers(c *gin.Context) {
 		return
 	}
 
-	//check privileges
-	if !service.AllService.AddressBookService.CheckUserReadPrivilege(u, uid, cid) {
+	al := service.AllService.AddressBookService.ListByUserIdAndCollectionId(uid, cid, 1, 1000)
+	peers, rule := a.AddressBooksVisibleToUser(u, uid, cid, al.AddressBooks)
+	if rule < model.ShareAddressBookRuleRuleRead {
 		response.Error(c, response.TranslateMsg(c, "NoAccess"))
 		return
 	}
-
-	al := service.AllService.AddressBookService.ListByUserIdAndCollectionId(uid, cid, 1, 1000)
 	c.JSON(http.StatusOK, gin.H{
-		"total":            al.Total,
-		"data":             al.AddressBooks,
+		"total":            len(peers),
+		"data":             peers,
 		"licensed_devices": 99999,
 	})
 }
@@ -661,9 +692,9 @@ func (a *Ab) PeerDel(c *gin.Context) {
 }
 
 // PeerUpdate
-// @Tags 地址[Personal]
-// @Summary 更新地址
-// @Description 更新地址
+// @Tags Address[Personal]
+// @Summary Update an address book record
+// @Description Update an address book record
 // @Accept  json
 // @Produce  json
 // @Param guid path string true "guid"
@@ -687,13 +718,7 @@ func (a *Ab) PeerUpdate(c *gin.Context) {
 		return
 	}
 
-	//check privileges
-	if !service.AllService.AddressBookService.CheckUserWritePrivilege(u, uid, cid) {
-		response.Error(c, response.TranslateMsg(c, "NoAccess"))
-		return
-	}
-	//fmt.Println(f)
-	//判断f["Id"]是否存在
+	// The record id is required before resolving per-record permissions.
 	fid, ok := f["id"]
 	if !ok {
 		response.Error(c, response.TranslateMsg(c, "ParamsError"))
@@ -706,15 +731,18 @@ func (a *Ab) PeerUpdate(c *gin.Context) {
 		response.Error(c, response.TranslateMsg(c, "ItemNotFound"))
 		return
 	}
-	//允许的字段
+	if service.AllService.AddressBookService.UserAddressBookRule(u, uid, cid, ab.RowId) < model.ShareAddressBookRuleRuleReadWrite {
+		response.Error(c, response.TranslateMsg(c, "NoAccess"))
+		return
+	}
+	// Only these fields can be changed by the RustDesk client.
 	allowUp := []string{"password", "hash", "tags", "alias"}
-	//f中的字段如果不在allowUp中，就删除
+	// Drop all fields outside the allow-list.
 	for k := range f {
 		if !utils.InArray(k, allowUp) {
 			delete(f, k)
 		}
 	}
-	//fmt.Println(f)
 	if tags, _ok := f["tags"]; _ok {
 		f["tags"], _ = json.Marshal(tags)
 	}

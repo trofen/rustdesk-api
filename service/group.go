@@ -8,7 +8,7 @@ import (
 type GroupService struct {
 }
 
-// InfoById 根据用户id取用户信息
+// InfoById returns a group by id.
 func (us *GroupService) InfoById(id uint) *model.Group {
 	u := &model.Group{}
 	DB.Where("id = ?", id).First(u)
@@ -29,21 +29,34 @@ func (us *GroupService) List(page, pageSize uint, where func(tx *gorm.DB)) (res 
 	return
 }
 
-// Create 创建
+// Create adds a group.
 func (us *GroupService) Create(u *model.Group) error {
 	res := DB.Create(u).Error
 	return res
 }
 func (us *GroupService) Delete(u *model.Group) error {
-	return DB.Delete(u).Error
+	tx := DB.Begin()
+	if err := tx.Where("type = ? and to_id = ?", model.ShareAddressBookRuleTypeGroup, u.Id).Delete(&model.AddressBookCollectionRule{}).Error; err != nil {
+		tx.Rollback()
+		return err
+	}
+	if err := tx.Where("type = ? and to_id = ?", model.ShareAddressBookRuleTypeGroup, u.Id).Delete(&model.AddressBookRule{}).Error; err != nil {
+		tx.Rollback()
+		return err
+	}
+	if err := tx.Delete(u).Error; err != nil {
+		tx.Rollback()
+		return err
+	}
+	return tx.Commit().Error
 }
 
-// Update 更新
+// Update changes a group.
 func (us *GroupService) Update(u *model.Group) error {
 	return DB.Model(u).Updates(u).Error
 }
 
-// DeviceGroupInfoById 根据用户id取用户信息
+// DeviceGroupInfoById returns a device group by id.
 func (us *GroupService) DeviceGroupInfoById(id uint) *model.DeviceGroup {
 	u := &model.DeviceGroup{}
 	DB.Where("id = ?", id).First(u)

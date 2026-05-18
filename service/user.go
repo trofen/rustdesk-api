@@ -206,40 +206,45 @@ func (us *UserService) Logout(u *model.User, token string) error {
 	return nil
 }
 
-// Delete 删除用户和oauth信息
+// Delete removes a user and related data.
 func (us *UserService) Delete(u *model.User) error {
 	userCount := us.getAdminUserCount()
 	if userCount <= 1 && us.IsAdmin(u) {
 		return errors.New("The last admin user cannot be deleted")
 	}
 	tx := DB.Begin()
-	// 删除用户
+	// Delete the user.
 	if err := tx.Delete(u).Error; err != nil {
 		tx.Rollback()
 		return err
 	}
-	// 删除关联的 OAuth 信息
+	// Delete linked OAuth records.
 	if err := tx.Where("user_id = ?", u.Id).Delete(&model.UserThird{}).Error; err != nil {
 		tx.Rollback()
 		return err
 	}
-	//  删除关联的ab
+	// Delete owned address book records.
 	if err := tx.Where("user_id = ?", u.Id).Delete(&model.AddressBook{}).Error; err != nil {
 		tx.Rollback()
 		return err
 	}
-	//  删除关联的abc
+	// Delete owned address book collections.
 	if err := tx.Where("user_id = ?", u.Id).Delete(&model.AddressBookCollection{}).Error; err != nil {
 		tx.Rollback()
 		return err
 	}
-	//  删除关联的abcr
-	if err := tx.Where("user_id = ?", u.Id).Delete(&model.AddressBookCollectionRule{}).Error; err != nil {
+	// Delete owned and user-targeted collection rules.
+	if err := tx.Where("user_id = ? or (type = ? and to_id = ?)", u.Id, model.ShareAddressBookRuleTypePersonal, u.Id).Delete(&model.AddressBookCollectionRule{}).Error; err != nil {
+		tx.Rollback()
+		return err
+	}
+	// Delete owned and user-targeted record rules.
+	if err := tx.Where("user_id = ? or (type = ? and to_id = ?)", u.Id, model.ShareAddressBookRuleTypePersonal, u.Id).Delete(&model.AddressBookRule{}).Error; err != nil {
 		tx.Rollback()
 		return err
 	}
 	tx.Commit()
-	// 删除关联的peer
+	// Unlink peers after the transactional database cleanup.
 	if err := AllService.PeerService.EraseUserId(u.Id); err != nil {
 		Logger.Warn("User deleted successfully, but failed to unlink peer.")
 		return nil

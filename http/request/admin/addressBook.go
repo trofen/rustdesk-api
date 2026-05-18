@@ -123,6 +123,14 @@ type AddressBookCollectionRuleQuery struct {
 	PageQuery
 }
 
+type AddressBookRuleQuery struct {
+	UserId           int `form:"user_id"`
+	CollectionId     int `form:"collection_id"`
+	AddressBookRowId int `form:"address_book_row_id"`
+	IsMy             int `form:"is_my"`
+	PageQuery
+}
+
 type BatchCreateFromPeersForm struct {
 	CollectionId uint     `json:"collection_id"`
 	PeerIds      []uint   `json:"peer_ids"`
